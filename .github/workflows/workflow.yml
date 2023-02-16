@@ -1,0 +1,84 @@
+name: wasabi GH
+on:
+  schedule:
+    - cron: "0 10,12 * * *" #Runs on the 9, and 11th hour UTC everyday
+  workflow_dispatch:
+jobs:
+  # ------------------------
+  DefineMatrix:
+    runs-on: ubuntu-latest
+    outputs:
+      accounts: ${{ steps.get-accounts.outputs.IDs }}
+    steps:
+      - name: Checkout repo content
+        uses: actions/checkout@v3 # checkout the repository content to github runner.
+      - name: Get Accounts
+        id: get-accounts
+        run: |
+          echo $(echo ${{ secrets.MATRIX }} | base64 --decode) > originalData.json
+          echo 'IDs<<EOF' >> $GITHUB_OUTPUT
+          jq "[.[] | { the_id: .id }]" originalData.json >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+          
+          rm -f originalData.json
+  # ------------------------
+  wasabi:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs:
+      - DefineMatrix
+    strategy:
+      matrix:
+        account: ${{ fromJSON(needs.DefineMatrix.outputs.accounts) }}
+    steps:
+      - name: Checkout repo content
+        uses: actions/checkout@v3 # checkout the repository content to github runner.
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10' #install the python needed
+
+      - name: Setup Google Chrome
+        run: bash wasabi/installers/google-chrome.sh
+
+      - name: Install Requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r wasabi/requirements.txt
+      - name: Setup wasabi
+        run: |
+          python wasabi/setup.py \
+          -gssi ${{ secrets.GOOGLE_SHEETS_SHEET_ID }} \
+          -gstn ${{ secrets.GOOGLE_SHEETS_TAB_NAME }}
+        #  -ta   ${{ secrets.TELEGRAM_API_TOKEN }}     \
+        #  -tu   ${{ secrets.TELEGRAM_USERID }}        \
+
+      - name: Set Secrets
+        id: sets-secrets
+        run: |
+          echo ${{ matrix.account.the_id }}
+          echo $(echo ${{ secrets.MATRIX }} | base64 --decode) > originalData.json
+
+          the_user=$(jq '.[] | select(.id=="${{ matrix.account.the_id }}") | .user' originalData.json)
+          the_pass=$(jq '.[] | select(.id=="${{ matrix.account.the_id }}") | .pass' originalData.json)
+          echo "::add-mask::$the_user"
+          echo "::add-mask::$the_pass"
+          echo "secret-user=$the_user" >> $GITHUB_OUTPUT
+          echo "secret-pass=$the_pass" >> $GITHUB_OUTPUT
+          rm -f originalData.json
+          unset the_user
+          unset the_pass
+
+          # GOOGLE_SHEETS configuration
+          echo $(echo ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }} | base64 --decode) > wasabi/config/google_sheets_credentials.json
+          echo $(echo ${{ secrets.GOOGLE_SHEETS_TOKEN_B64 }} | base64 --decode) > wasabi/config/google_sheets_token.json
+
+      - name: Run for Account ${{ matrix.account.the_id }}
+        run: |
+          python wasabi/wasabi.py -r -hl -nc -gs \
+          -e '${{ steps.sets-secrets.outputs.secret-user }}' \
+          -p '${{ steps.sets-secrets.outputs.secret-pass }}'
+
+          # cleanup
+          rm -rf BingRewards/config

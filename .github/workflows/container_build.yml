@@ -1,0 +1,45 @@
+name: Container Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      IMAGE_NAME: ${{ github.repository }}
+      REGISTRY: ghcr.io
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Container metadata
+      id: container_metadata
+      uses: actions/github-script@v6
+      with:
+        script: |
+          core.setOutput('image', `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}`);
+          core.setOutput('datetime', new Date().toISOString());
+
+    - name: Build container
+      run: |
+        short_sha=$(git rev-parse --short ${{ github.sha }})
+        docker build -f Dockerfile -t ${{ steps.container_metadata.outputs.image }}:${short_sha} \
+            --build-arg COMMIT_SHA=${{ github.sha }} \
+            --build-arg CREATED="${{ steps.container_metadata.outputs.datetime }}" \
+            .
+        docker tag ${{ steps.container_metadata.outputs.image }}:${short_sha} \
+                   ${{ steps.container_metadata.outputs.image }}:latest
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Push
+      run: | 
+        docker push --all-tags ${{ steps.container_metadata.outputs.image }}

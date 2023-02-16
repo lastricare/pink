@@ -1,0 +1,121 @@
+name: wasabi on ACI DE
+on:
+  workflow_dispatch:
+
+env:
+  RG_NAME: "de-ephemeral"
+  ACI_PREFIX: "de-aci"
+  LOCATION: "DE"
+  CONTAINER_IMAGE: "ghcr.io/malesci/wasabi:latest"
+
+jobs:
+
+  # define matrix for all executions
+  # ------------------------
+  DefineMatrix:
+    runs-on: ubuntu-latest
+    outputs:
+      accounts: ${{ steps.get-accounts.outputs.IDs }}
+    steps:
+      - name: Checkout repo content
+        uses: actions/checkout@v3 # checkout the repository content to github runner.
+      - name: Get Accounts
+        id: get-accounts
+        run: |
+          echo $(echo ${{ secrets.MATRIXACI }} | base64 --decode) > originalData.json
+          
+          echo 'IDs<<EOF' >> $GITHUB_OUTPUT
+          jq '[.[] | select((has("location") | not) or (.location=="${{ env.LOCATION }}")) | { the_id: .id }]' originalData.json >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+
+          #$(jq '[.[] | { the_id: .id, the_location: .location }]' originalData.json)
+
+          rm -f originalData.json
+  # ------------------------
+
+  # deploy a container for the job
+  run_in_container:
+    name: Run container
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs:
+      - DefineMatrix
+    strategy:
+      matrix:
+        account: ${{ fromJSON(needs.DefineMatrix.outputs.accounts) }}
+    steps:
+    - name: Set Secrets
+      id: sets-secrets
+      run: |
+        echo ${{ matrix.account.the_id }}
+        echo $(echo ${{ secrets.MATRIXACI }} | base64 --decode) > originalData.json
+        the_user=$(jq '.[] | select(.id=="${{ matrix.account.the_id }}") | .user' originalData.json)
+        the_pass=$(jq '.[] | select(.id=="${{ matrix.account.the_id }}") | .pass' originalData.json)
+        echo "::add-mask::$the_user"
+        echo "::add-mask::$the_pass"
+        echo "secret-user=$the_user" >> $GITHUB_OUTPUT
+        echo "secret-pass=$the_pass" >> $GITHUB_OUTPUT
+        rm -f originalData.json
+        unset the_user
+        unset the_pass
+
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    # Note: Azure/login action also supports OIDC login mechanism. 
+    # Refer https://github.com/azure/login#configure-a-service-principal-with-a-federated-credential-to-use-oidc-based-authentication for more details.
+
+    ##for subnet integration add --subnet ${{ inputs.subnet_id }}
+    - name: Create container
+      run: |
+        az container create \
+          --resource-group ${{ env.RG_NAME }} \
+          --name ${{ env.ACI_PREFIX }}-${{ github.run_id }}-${{ matrix.account.the_id }} \
+          --cpu 1 --memory 1 \
+          --image ${{ env.CONTAINER_IMAGE }} \
+          --restart-policy Never \
+          --environment-variables \
+            GOOGLE_SHEETS_CREDENTIALS_B64=${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }} \
+            GOOGLE_SHEETS_TOKEN_B64=${{ secrets.GOOGLE_SHEETS_TOKEN_B64 }} \
+            GOOGLE_SHEETS_SHEET_ID=${{ secrets.GOOGLE_SHEETS_SHEET_ID }} \
+            GOOGLE_SHEETS_TAB_NAME=${{ secrets.GOOGLE_SHEETS_TAB_NAME }} \
+            USER=${{ steps.sets-secrets.outputs.secret-user }} \
+            PASS=${{ steps.sets-secrets.outputs.secret-pass }}
+
+            #TELEGRAM_API_TOKEN=${{ secrets.TELEGRAM_API_TOKEN }} \
+            #TELEGRAM_USERID=${{ secrets.TELEGRAM_USERID }} \
+
+    - name: Wait for container to complete
+      run: |
+        az container show \
+          --resource-group ${{ env.RG_NAME }} \
+          --name ${{ env.ACI_PREFIX }}-${{ github.run_id }}-${{ matrix.account.the_id }} \
+          --query instanceView.state
+        state=$(az container show --name ${{ env.ACI_PREFIX }}-${{ github.run_id }}-${{ matrix.account.the_id }} --resource-group ${{ env.RG_NAME }} --query containers[0].instanceView.currentState.state | tr -d '"')
+        while [ "$state" != "Terminated" ]; do
+            echo $state
+            sleep 60
+            state=$(az container show --name ${{ env.ACI_PREFIX }}-${{ github.run_id }}-${{ matrix.account.the_id }} --resource-group ${{ env.RG_NAME }} --query containers[0].instanceView.currentState.state | tr -d '"')
+        done
+        echo "Il container è terminato"
+
+    - name: Get container logs
+      id: get_container_logs
+      run: |
+        az container logs \
+          --resource-group ${{ env.RG_NAME }} \
+          --name ${{ env.ACI_PREFIX }}-${{ github.run_id }}-${{ matrix.account.the_id }} \
+          --output json
+   #   env:
+   #     CONTAINER_LOGS: ${{ steps.get_container_logs.outputs.logs }}
+
+   # - name: Print container logs
+   #   run: echo "$CONTAINER_LOGS"
+
+    - name: Delete container
+      run: |
+        az container delete \
+          --resource-group ${{ env.RG_NAME }} \
+          --name ${{ env.ACI_PREFIX }}-${{ github.run_id }}-${{ matrix.account.the_id }} \
+          --yes

@@ -1,0 +1,138 @@
+name: wasabi ACI GHR
+on:
+  workflow_dispatch:
+  #schedule:
+  #  - cron: "0 17 * * *" #Runs on the 17th hour UTC everyday
+
+env:
+  RG_NAME: "cd-ephemeral"
+  ACI_PREFIX: "cd-shrunner-aci"
+  RUNNER_IMAGE: "ghcr.io/malesci/python-actions-runner:01ae12340bccbe673bcce43ceed96de53a1d96b1"
+
+jobs:
+
+  # define matrix for all executions
+  define_matrix:
+    name: Define matrix
+    runs-on: ubuntu-20.04
+    outputs:
+      accounts: ${{ steps.get-accounts.outputs.IDs }}
+    steps:
+      - name: Checkout repo content
+        uses: actions/checkout@v3 # checkout the repository content to github runner.
+      - name: Get Accounts
+        id: get-accounts
+        run: |
+          echo $(echo ${{ secrets.MATRIX }} | base64 --decode) > originalData.json
+          echo 'IDs<<EOF' >> $GITHUB_OUTPUT
+          jq "[.[] | { the_id: .id }]" originalData.json >> $GITHUB_OUTPUT
+          echo 'EOF' >> $GITHUB_OUTPUT
+          rm -f originalData.json
+
+  # deploy a runner for the job
+  deploy_runner:
+    name: Deploy ephemeral runner
+    needs: [ define_matrix ]
+    runs-on: ubuntu-latest
+   # continue-on-error: true
+    strategy:
+      matrix:
+        account: ${{ fromJSON(needs.define_matrix.outputs.accounts) }}    
+    steps:
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+    ##for subnet integration add --subnet ${{ inputs.subnet_id }}
+    - name: Create runner
+      run: |
+        az container create \
+          -g ${{ env.RG_NAME }} -n ${{ env.ACI_PREFIX }}-${{ github.run_id }}-${{ matrix.account.the_id }} \
+          --image ${{ env.RUNNER_IMAGE }} --restart-policy Never \
+          --cpu 1 --memory 1 \
+          --environment-variables \
+            RUNNER_REPOSITORY_URL=https://github.com/${{ github.repository }} \
+            GITHUB_TOKEN=${{ secrets.REPO_PAT }} \
+            RUNNER_OPTIONS="--ephemeral" \
+            RUNNER_LABELS=${{ matrix.account.the_id }} \
+            RUNNER_NAME=${{ env.ACI_PREFIX }}-${{ github.run_id }}-${{ matrix.account.the_id }}
+
+  # do the real work
+  bing_rewards:
+    name: Run BingRewards
+    needs: [ deploy_runner, define_matrix ]
+    runs-on: 
+      - self-hosted
+      - ${{ matrix.account.the_id }}
+    continue-on-error: true
+    strategy:
+      matrix:
+        account: ${{ fromJSON(needs.define_matrix.outputs.accounts) }}
+      
+    steps:
+      - name: Checkout repo content
+        uses: actions/checkout@v3 # checkout the repository content to github runner.
+
+      #- name: Install requirements
+      #  run: |
+      #    pip install -r BingRewards/requirements.txt
+
+      - name: Setup BingRewards
+        run: |
+          python setup.py \
+          -gssi ${{ secrets.GOOGLE_SHEETS_SHEET_ID }} \
+          -gstn ${{ secrets.GOOGLE_SHEETS_TAB_NAME }}
+
+        #  -ta   ${{ secrets.TELEGRAM_API_TOKEN }}     \
+        #  -tu   ${{ secrets.TELEGRAM_USERID }}        \
+
+      - name: Set secrets
+        id: sets-secrets
+        run: |
+          echo ${{ matrix.account.the_id }}
+          echo $(echo ${{ secrets.MATRIX }} | base64 --decode) > originalData.json
+          
+          the_user=$(jq '.[] | select(.id=="${{ matrix.account.the_id }}") | .user' originalData.json)
+          the_pass=$(jq '.[] | select(.id=="${{ matrix.account.the_id }}") | .pass' originalData.json)
+
+          echo "::add-mask::$the_user"
+          echo "::add-mask::$the_pass"
+
+          echo "secret-user=$the_user" >> $GITHUB_OUTPUT
+          echo "secret-pass=$the_pass" >> $GITHUB_OUTPUT
+
+          rm -f originalData.json
+          unset the_user
+          unset the_pass
+          
+          # GOOGLE_SHEETS configuration
+          echo $(echo ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }} | base64 --decode) > BingRewards/config/google_sheets_credentials.json
+          echo $(echo ${{ secrets.GOOGLE_SHEETS_TOKEN_B64 }} | base64 --decode) > BingRewards/config/google_sheets_token.json
+          
+      - name: Run BingRewards for Account ${{ matrix.account.the_id }}
+        run: |
+          python BingRewards/BingRewards.py -r -hl -nsb -nc -gs \
+          -e ${{ steps.sets-secrets.outputs.secret-user }} \
+          -p ${{ steps.sets-secrets.outputs.secret-pass }}
+          
+          # cleanup
+          rm -rf BingRewards/config
+
+  # deploy a runner for the job
+  delete_aci:
+    name: Destroy ephemeral runners
+    needs: [ define_matrix, deploy_runner, bing_rewards ]
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        account: ${{ fromJSON(needs.define_matrix.outputs.accounts) }}    
+    steps:
+    - name: Login to Azure
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+    - name: Delete ACI
+      run: |
+        az container delete -g ${{ env.RG_NAME }} -n ${{ env.ACI_PREFIX }}-${{ github.run_id }}-${{ matrix.account.the_id }} --yes
